@@ -77,17 +77,36 @@ endif()
 add_subdirectory(LUA)
 add_subdirectory(Utility)
 
-set(PHYSICS_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
-include(${PHYSICS_REPO_ROOT}/Jolt/Jolt.cmake)
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    # Jolt triggers a bug in some GCC versions, so we need to disable the warning
-    target_compile_options(Jolt PRIVATE -Wno-stringop-overflow)
+# Physics backend. wiPhysics_Jolt.cpp and wiPhysics_PhysX.cpp define the same symbols, so exactly one of them is
+#	compiled and the unselected one is dropped from the glob below. PhysX exists to make the solver type a measurable
+#	variable for robot simulation (reduced coordinate articulations, TGS or PGS); Jolt stays the default so that an
+#	unconfigured build is the upstream one.
+set(WICKED_PHYSICS_BACKEND "Jolt" CACHE STRING "Physics backend to compile: Jolt or PhysX")
+set_property(CACHE WICKED_PHYSICS_BACKEND PROPERTY STRINGS Jolt PhysX)
+if (NOT WICKED_PHYSICS_BACKEND MATCHES "^(Jolt|PhysX)$")
+    message(FATAL_ERROR "WICKED_PHYSICS_BACKEND must be Jolt or PhysX, got '${WICKED_PHYSICS_BACKEND}'")
 endif()
+message(STATUS "Physics backend: ${WICKED_PHYSICS_BACKEND}")
 
-set_target_properties(Jolt PROPERTIES
-    POSITION_INDEPENDENT_CODE ${WICKED_PIC}
-)
-add_compile_definitions(Jolt JPH_DEBUG_RENDERER)
+if (WICKED_PHYSICS_BACKEND STREQUAL "Jolt")
+    set(PHYSICS_REPO_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
+    include(${PHYSICS_REPO_ROOT}/Jolt/Jolt.cmake)
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # Jolt triggers a bug in some GCC versions, so we need to disable the warning
+        target_compile_options(Jolt PRIVATE -Wno-stringop-overflow)
+    endif()
+
+    set_target_properties(Jolt PROPERTIES
+        POSITION_INDEPENDENT_CODE ${WICKED_PIC}
+    )
+    add_compile_definitions(Jolt JPH_DEBUG_RENDERER)
+else()
+    # Fetched and built inside this build tree, CPU pipeline only (cmake/FetchPhysX.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchPhysX.cmake)
+    set_target_properties(PhysX PhysXCommon PhysXFoundation PhysXExtensions PhysXCooking PROPERTIES
+        POSITION_INDEPENDENT_CODE ${WICKED_PIC}
+    )
+endif()
 
 file(GLOB HEADER_FILES CONFIGURE_DEPENDS *.h)
 file(GLOB SOURCE_FILES CONFIGURE_DEPENDS *.cpp)
@@ -95,6 +114,11 @@ list(REMOVE_ITEM SOURCE_FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/offlineshadercompiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/wiRenderer.cpp
 )
+if (WICKED_PHYSICS_BACKEND STREQUAL "Jolt")
+    list(REMOVE_ITEM SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/wiPhysics_PhysX.cpp)
+else()
+    list(REMOVE_ITEM SOURCE_FILES ${CMAKE_CURRENT_SOURCE_DIR}/wiPhysics_Jolt.cpp)
+endif()
 
 file(GLOB SHADER_FILES CONFIGURE_DEPENDS shaders/*.hlsl shaders/*.hlsli)
 
@@ -173,10 +197,15 @@ target_include_directories(WickedEngine_common SYSTEM PUBLIC
 )
 
 set(WICKEDENGINE_STATIC_LIBRARIES
-    Jolt
     LUA
     Utility
 )
+if (WICKED_PHYSICS_BACKEND STREQUAL "Jolt")
+    list(APPEND WICKEDENGINE_STATIC_LIBRARIES Jolt)
+else()
+    # physx_lib is an INTERFACE target carrying the include paths and the eight static libraries
+    list(APPEND WICKEDENGINE_STATIC_LIBRARIES physx_lib)
+endif()
 
 if (USE_AVX512 OR USE_AVX2)
     target_compile_definitions(WickedEngine_common PUBLIC _XM_AVX2_INTRINSICS_)
@@ -298,6 +327,7 @@ set_property(SOURCE
     wiAudio.cpp
     wiOcean.cpp
     wiPhysics_Jolt.cpp
+    wiPhysics_PhysX.cpp
     wiGraphicsDevice_Vulkan.cpp
     wiGraphicsDevice_DX12.cpp
 
@@ -307,8 +337,11 @@ set_property(TARGET LUA PROPERTY UNITY_BUILD NO)
 
 
 if(WICKED_ENABLE_IPO)
+    # physx_lib is an INTERFACE target and INTERFACE libraries reject non-whitelisted properties
+    set(WICKEDENGINE_IPO_LIBRARIES ${WICKEDENGINE_STATIC_LIBRARIES})
+    list(REMOVE_ITEM WICKEDENGINE_IPO_LIBRARIES physx_lib)
     set_target_properties(
-        ${WICKEDENGINE_STATIC_LIBRARIES}
+        ${WICKEDENGINE_IPO_LIBRARIES}
         WickedEngine_common
         offlineshadercompiler
 
