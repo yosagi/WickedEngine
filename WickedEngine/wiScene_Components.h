@@ -652,6 +652,129 @@ namespace wi::scene
 		void Serialize(wi::Archive& archive, wi::ecs::EntitySerializer& seri);
 	};
 
+	// One link (rigid body) of an articulated body (robot, mechanism).
+	//	Every link entity has this component; the link tree is described by the parent entity references.
+	//	The joint connecting a link to its parent is owned by the child link (like URDF and PhysX articulations).
+	//	Link entities must not have RigidBodyPhysicsComponent, the shapes and mass properties are described here instead.
+	//	The link entity's TransformComponent must hold the world pose of the link frame at creation time,
+	//	that pose is consistent with joint angle = initial_position.
+	//	To issue recreation of the whole articulation, reset the physicsobject pointer of the ArticulationComponent on the root entity
+	struct alignas(32) ArticulationLinkComponent
+	{
+		enum FLAGS
+		{
+			EMPTY = 0,
+			REFRESH_PARAMETERS_REQUEST = 1 << 0,
+		};
+		uint32_t _flags = EMPTY;
+
+		wi::ecs::Entity parent = wi::ecs::INVALID_ENTITY; // parent link entity, INVALID_ENTITY for the root link
+
+		enum class JointType : uint32_t
+		{
+			Fixed,		// no relative motion to parent
+			Revolute,	// rotation around axis
+			Prismatic,	// translation along axis (not implemented by all backends)
+		} joint_type = JointType::Fixed;
+
+		// Joint frame expressed in the parent link's frame:
+		XMFLOAT3 joint_position_parent = XMFLOAT3(0, 0, 0);
+		XMFLOAT4 joint_rotation_parent = XMFLOAT4(0, 0, 0, 1);
+		// Joint frame expressed in this (child) link's frame:
+		XMFLOAT3 joint_position_child = XMFLOAT3(0, 0, 0);
+		XMFLOAT4 joint_rotation_child = XMFLOAT4(0, 0, 0, 1);
+		// Joint axis in the joint frame (unit vector):
+		XMFLOAT3 axis = XMFLOAT3(0, 0, 1);
+
+		float limit_min = -XM_PI;		// radians (or meters for prismatic)
+		float limit_max = XM_PI;		// radians (or meters for prismatic)
+		float joint_friction = 0;		// N*m (or N), passive friction of the joint
+		float joint_friction_velocity = 0.05f;	// rad/s (or m/s), joint speed at which the friction reaches its full value. Backends that cannot
+										//	express dry friction exactly (Jolt while a motor drives the joint) approximate it with a damper saturated
+										//	here, which means an effective damping of joint_friction / joint_friction_velocity below this speed
+		float armature = 0;				// kg*m^2, extra rotor inertia around the axis (approximated by some backends)
+		float initial_position = 0;		// joint position that the TransformComponents were placed with at creation time
+
+		struct Drive
+		{
+			float target_position = 0;	// radians (or meters)
+			float target_velocity = 0;	// radians/s (or m/s)
+			float stiffness = 0;		// Kp, N*m/rad (0 = no position drive)
+			float damping = 0;			// Kd, N*m*s/rad
+			float max_force = FLT_MAX;	// N*m (or N), drive output saturation
+			float feedforward_force = 0;// N*m (or N), applied directly every physics step
+		} drive;
+
+		struct Shape
+		{
+			RigidBodyPhysicsComponent::CollisionShape type = RigidBodyPhysicsComponent::CollisionShape::BOX;
+			XMFLOAT3 halfextents = XMFLOAT3(0.1f, 0.1f, 0.1f);	// box
+			float radius = 0.1f;								// sphere, capsule, cylinder
+			float height = 0.1f;								// capsule, cylinder (full length of the cylindrical part, along local Y axis)
+			XMFLOAT3 position = XMFLOAT3(0, 0, 0);				// shape pose in link frame
+			XMFLOAT4 rotation = XMFLOAT4(0, 0, 0, 1);
+			int32_t sensor_id = -1;								// >= 0: contact forces on this shape are accumulated into contact_sensors[sensor_id]
+		};
+		wi::vector<Shape> shapes;
+
+		// Mass properties of the link (fallback: computed from the shapes when mass_provided is false):
+		float mass = 1;												// kg
+		XMFLOAT3 center_of_mass = XMFLOAT3(0, 0, 0);				// in link frame
+		XMFLOAT3X3 inertia = XMFLOAT3X3(1, 0, 0, 0, 1, 0, 0, 0, 1);	// kg*m^2, about the center of mass, in link frame
+		float friction = 0.6f;
+		float restitution = 0;
+
+		// Non-serialized attributes:
+		float position = 0;	// joint position [rad or m], measured (initial_position is added to the backend's internal angle)
+		float velocity = 0;	// joint velocity [rad/s or m/s], measured
+		float force = 0;	// joint force [N*m or N] exerted by the drive and limits on this link, measured
+		XMFLOAT3 joint_force = XMFLOAT3(0, 0, 0);		// world space, linear force transmitted by the joint from the parent to this link [N] (constraint force)
+		XMFLOAT3 external_force = XMFLOAT3(0, 0, 0);	// world space, estimated total external force on this link excluding gravity and joints (contacts) [N], from m*(a-g) - joint forces
+		struct ContactSensor
+		{
+			XMFLOAT3 force = XMFLOAT3(0, 0, 0);	// world space, contact force acting on the shape [N], estimated pairwise (underestimates for articulated bodies, use external_force for the total)
+			uint32_t contact_count = 0;
+		};
+		wi::vector<ContactSensor> contact_sensors; // indexed by Shape::sensor_id
+
+		constexpr void SetRefreshParametersNeeded(bool value = true) { set_flag(_flags, REFRESH_PARAMETERS_REQUEST, value); }
+		constexpr bool IsRefreshParametersNeeded() const { return _flags & REFRESH_PARAMETERS_REQUEST; }
+
+		void Serialize(wi::Archive& archive, wi::ecs::EntitySerializer& seri);
+	};
+
+	// Articulated body (tree of ArticulationLinkComponents). This is placed on the root link's entity.
+	struct alignas(32) ArticulationComponent
+	{
+		enum FLAGS
+		{
+			EMPTY = 0,
+			FIX_BASE = 1 << 0,						// root link is fixed in the world
+			SELF_COLLISION_ALL_DISABLED = 1 << 1,	// disable collision between all links (default: only parent-child pairs are disabled)
+			REFRESH_PARAMETERS_REQUEST = 1 << 2,
+		};
+		uint32_t _flags = EMPTY;
+
+		uint32_t velocity_iterations = 0;	// solver iteration override for this articulation, 0 = backend default
+		uint32_t position_iterations = 0;	// solver iteration override for this articulation, 0 = backend default
+
+		// Non-serialized attributes:
+		XMFLOAT3 root_linear_velocity = XMFLOAT3(0, 0, 0);		// world space, at root link frame origin
+		XMFLOAT3 root_angular_velocity = XMFLOAT3(0, 0, 0);		// world space
+		XMFLOAT3 root_linear_acceleration = XMFLOAT3(0, 0, 0);	// world space, at root link frame origin, excluding gravity
+		uint32_t link_count = 0;								// number of links that were created
+		wi::allocator::shared_ptr<void> physicsobject; // You can reset this to recreate the physics object the next time phsyics system will be running.
+
+		constexpr void SetFixBase(bool value = true) { set_flag(_flags, FIX_BASE, value); }
+		constexpr bool IsFixBase() const { return _flags & FIX_BASE; }
+		constexpr void SetSelfCollisionAllDisabled(bool value = true) { set_flag(_flags, SELF_COLLISION_ALL_DISABLED, value); }
+		constexpr bool IsSelfCollisionAllDisabled() const { return _flags & SELF_COLLISION_ALL_DISABLED; }
+		constexpr void SetRefreshParametersNeeded(bool value = true) { set_flag(_flags, REFRESH_PARAMETERS_REQUEST, value); }
+		constexpr bool IsRefreshParametersNeeded() const { return _flags & REFRESH_PARAMETERS_REQUEST; }
+
+		void Serialize(wi::Archive& archive, wi::ecs::EntitySerializer& seri);
+	};
+
 	struct alignas(32) MeshComponent
 	{
 		enum FLAGS

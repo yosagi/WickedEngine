@@ -1020,6 +1020,102 @@ namespace wi::scene
 			}
 		}
 	}
+	void ArticulationLinkComponent::Serialize(wi::Archive& archive, EntitySerializer& seri)
+	{
+		if (archive.IsReadMode())
+		{
+			archive >> _flags;
+			SerializeEntity(archive, parent, seri);
+			archive >> (uint32_t&)joint_type;
+			archive >> joint_position_parent;
+			archive >> joint_rotation_parent;
+			archive >> joint_position_child;
+			archive >> joint_rotation_child;
+			archive >> axis;
+			archive >> limit_min;
+			archive >> limit_max;
+			archive >> joint_friction;
+			archive >> armature;
+			archive >> initial_position;
+			archive >> drive.target_position;
+			archive >> drive.target_velocity;
+			archive >> drive.stiffness;
+			archive >> drive.damping;
+			archive >> drive.max_force;
+			archive >> drive.feedforward_force;
+			size_t shape_count = 0;
+			archive >> shape_count;
+			shapes.resize(shape_count);
+			for (Shape& shape : shapes)
+			{
+				archive >> (uint32_t&)shape.type;
+				archive >> shape.halfextents;
+				archive >> shape.radius;
+				archive >> shape.height;
+				archive >> shape.position;
+				archive >> shape.rotation;
+				archive >> shape.sensor_id;
+			}
+			archive >> mass;
+			archive >> center_of_mass;
+			archive >> inertia;
+			archive >> friction;
+			archive >> restitution;
+		}
+		else
+		{
+			archive << _flags;
+			SerializeEntity(archive, parent, seri);
+			archive << (uint32_t&)joint_type;
+			archive << joint_position_parent;
+			archive << joint_rotation_parent;
+			archive << joint_position_child;
+			archive << joint_rotation_child;
+			archive << axis;
+			archive << limit_min;
+			archive << limit_max;
+			archive << joint_friction;
+			archive << armature;
+			archive << initial_position;
+			archive << drive.target_position;
+			archive << drive.target_velocity;
+			archive << drive.stiffness;
+			archive << drive.damping;
+			archive << drive.max_force;
+			archive << drive.feedforward_force;
+			archive << shapes.size();
+			for (const Shape& shape : shapes)
+			{
+				archive << (uint32_t&)shape.type;
+				archive << shape.halfextents;
+				archive << shape.radius;
+				archive << shape.height;
+				archive << shape.position;
+				archive << shape.rotation;
+				archive << shape.sensor_id;
+			}
+			archive << mass;
+			archive << center_of_mass;
+			archive << inertia;
+			archive << friction;
+			archive << restitution;
+		}
+	}
+	void ArticulationComponent::Serialize(wi::Archive& archive, EntitySerializer& seri)
+	{
+		if (archive.IsReadMode())
+		{
+			archive >> _flags;
+			archive >> velocity_iterations;
+			archive >> position_iterations;
+		}
+		else
+		{
+			archive << _flags;
+			archive << velocity_iterations;
+			archive << position_iterations;
+		}
+	}
 	void SoftBodyPhysicsComponent::Serialize(wi::Archive& archive, EntitySerializer& seri)
 	{
 		wi::vector<uint32_t> graphicsToPhysicsVertexMapping;

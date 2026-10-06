@@ -25,6 +25,10 @@
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/OffsetCenterOfMassShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
+#include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
+#include <Jolt/Physics/Collision/EstimateCollisionResponse.h>
+#include <Jolt/Physics/PhysicsStepListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
@@ -56,6 +60,9 @@
 #endif // JPH_DEBUG_RENDERER
 
 #include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
 
 // Disable common warnings triggered by Jolt, you can use JPH_SUPPRESS_WARNING_PUSH / JPH_SUPPRESS_WARNING_POP to store and restore the warning state
 JPH_SUPPRESS_WARNINGS
@@ -92,9 +99,13 @@ namespace wi::physics
 		int softbodyIterationCount = 6;
 		float TIMESTEP = 1.0f / 60.0f;
 		bool INTERPOLATION = true;
+		bool ASYNC_SIMULATION = false;
 		float CHARACTER_COLLISION_TOLERANCE = 0.05f;
 		float DEBUG_MAX_DRAW_DISTANCE = 500.0f;
+		uint32_t DEBUG_MAX_DRAW_TRIANGLES = 200000; // shapes with more triangles (large height fields / meshes) are not wireframe-drawn
 		int COLLISION_STEPS = 1;
+		int SOLVER_VELOCITY_ITERATIONS = 10; // Jolt default
+		int SOLVER_POSITION_ITERATIONS = 2; // Jolt default
 
 		// Physics shape cache data structures for reusing complex shapes across multiple rigid bodies
 		struct PhysicsShapeCacheKey
@@ -262,22 +273,204 @@ namespace wi::physics
 			}
 		} jolt_destroyer;
 
+		// Contact force accumulator for sensor shapes (articulation links):
+		//	Leaf shapes that report contacts store a pointer to this in their user data
+		struct ContactAccumulator
+		{
+			wi::SpinLock lock;
+			Vec3 force = Vec3::sZero(); // world space force acting on the sensor shape [N]
+			uint32_t count = 0;
+
+			void Reset()
+			{
+				lock.lock();
+				force = Vec3::sZero();
+				count = 0;
+				lock.unlock();
+			}
+			void Add(Vec3Arg f)
+			{
+				lock.lock();
+				force += f;
+				count++;
+				lock.unlock();
+			}
+		};
+		// Contact listener that estimates contact forces for sensor shapes
+		//	Note: contact callbacks are called from multiple threads, before the solver runs,
+		//	so the impulses are estimated with EstimateCollisionResponse (not the exact solver result)
+		class SensorContactListener : public ContactListener
+		{
+		public:
+			void OnContactAdded(const Body& inBody1, const Body& inBody2, const ContactManifold& inManifold, ContactSettings& ioSettings) override
+			{
+				Record(inBody1, inBody2, inManifold, ioSettings);
+			}
+			void OnContactPersisted(const Body& inBody1, const Body& inBody2, const ContactManifold& inManifold, ContactSettings& ioSettings) override
+			{
+				Record(inBody1, inBody2, inManifold, ioSettings);
+			}
+		private:
+			void Record(const Body& inBody1, const Body& inBody2, const ContactManifold& inManifold, const ContactSettings& ioSettings)
+			{
+				if (!inBody1.IsRigidBody() || !inBody2.IsRigidBody())
+					return;
+				ContactAccumulator* sensor1 = (ContactAccumulator*)inBody1.GetShape()->GetSubShapeUserData(inManifold.mSubShapeID1);
+				ContactAccumulator* sensor2 = (ContactAccumulator*)inBody2.GetShape()->GetSubShapeUserData(inManifold.mSubShapeID2);
+				if (sensor1 == nullptr && sensor2 == nullptr)
+					return;
+
+				CollisionEstimationResult estimation;
+				EstimateCollisionResponse(inBody1, inBody2, inManifold, estimation, ioSettings.mCombinedFriction, ioSettings.mCombinedRestitution, 1.0f, 4);
+
+				// Impulse along the normal, acting on body2 (normal points from body1 to body2):
+				float normal_impulse = 0;
+				for (float impulse : estimation.mContactImpulse)
+				{
+					normal_impulse += impulse;
+				}
+				Vec3 impulse_on_body2 = inManifold.mWorldSpaceNormal * normal_impulse;
+				impulse_on_body2 += estimation.mTangent1 * estimation.mFrictionImpulse1 + estimation.mTangent2 * estimation.mFrictionImpulse2;
+				Vec3 force_on_body2 = impulse_on_body2 / TIMESTEP;
+
+				if (sensor2 != nullptr)
+				{
+					sensor2->Add(force_on_body2);
+				}
+				if (sensor1 != nullptr)
+				{
+					sensor1->Add(-force_on_body2);
+				}
+			}
+		};
+
+		struct PhysicsScene;
+		struct Articulation;
+		void StepThreadMain(PhysicsScene* physics_scene);
+
 		struct PhysicsScene
 		{
 			PhysicsSystem physics_system;
 			BPLayerInterfaceImpl broad_phase_layer_interface;
 			ObjectVsBroadPhaseLayerFilterImpl object_vs_broadphase_layer_filter;
 			ObjectLayerPairFilterImpl object_vs_object_layer_filter;
+			SensorContactListener sensor_contact_listener;
 			PhysicsShapeCache physics_shape_cache;
 			float accumulator = 0;
 			float alpha = 0;
 			bool activate_all_rigid_bodies = false;
 			bool optimize_broadphase = false;
+			uint32_t steps_last_frame = 0; // how many simulation steps were performed by the last update
+			double sim_time = 0; // total simulated time [s]
+			uint64_t step_count = 0; // total simulation steps
+			wi::unordered_map<Entity, wi::physics::ArticulationStepCallback> articulation_callbacks; // by root entity
 			float GetKinematicDT(float dt) const
 			{
 				return clamp(accumulator + dt, 0.0f, TIMESTEP * ACCURACY);
 			}
+
+			// Articulations that were created in this scene (registered by AddArticulation, unregistered by the destructor), stepped by the step thread:
+			wi::vector<Articulation*> articulations;
+
+			// Asynchronous simulation (dedicated stepping thread):
+			mutable std::recursive_mutex step_mutex;		// serializes the stepping thread with everything else that touches physics_system
+			std::atomic<bool> update_in_progress = false;	// RunPhysicsUpdateSystem holds step_mutex, job workers inside it must not lock again
+			std::atomic<bool> step_thread_running = false;
+			std::atomic<bool> step_thread_quit = false;
+			std::thread step_thread;
+			std::unique_ptr<JobSystemThreadPool> step_thread_job_system;		// owned by the scene, so that its lifetime is tied to the stepping thread (function local statics would be destroyed before global objects at exit)
+			std::unique_ptr<TempAllocatorMalloc> step_thread_temp_allocator;
+			std::atomic<uint64_t> steps_since_readback = 0;
+			std::atomic<double> stat_wall_lag_ms = 0;
+			std::atomic<double> stat_step_ms_acc = 0;
+			std::atomic<uint32_t> stat_step_count = 0;
+			std::atomic<double> stat_step_ms_max = 0;
+			std::atomic<uint32_t> stat_resync_count = 0;
+
+			void StartStepThread()
+			{
+				if (step_thread_running)
+					return;
+				step_thread_quit = false;
+				step_thread_job_system = std::make_unique<JobSystemThreadPool>(cMaxPhysicsJobs, cMaxPhysicsBarriers, thread::hardware_concurrency() - 1);
+				step_thread_temp_allocator = std::make_unique<TempAllocatorMalloc>();
+				step_thread_running = true;
+				step_thread = std::thread(StepThreadMain, this);
+			}
+			void StopStepThread()
+			{
+				if (!step_thread_running)
+					return;
+				step_thread_quit = true;
+				if (step_thread.joinable())
+				{
+					step_thread.join();
+				}
+				step_thread_running = false;
+				step_thread_job_system.reset();
+				step_thread_temp_allocator.reset();
+			}
+			~PhysicsScene()
+			{
+				StopStepThread();
+			}
 		};
+
+		// Lock that serializes with the stepping thread (no-op when the thread isn't running, or when called from inside RunPhysicsUpdateSystem which already holds the lock)
+		struct StepLock
+		{
+			const PhysicsScene* physics_scene = nullptr;
+			StepLock(const PhysicsScene& scene)
+			{
+				if (scene.step_thread_running && !scene.update_in_progress)
+				{
+					physics_scene = &scene;
+					physics_scene->step_mutex.lock();
+				}
+			}
+			~StepLock()
+			{
+				if (physics_scene != nullptr)
+				{
+					physics_scene->step_mutex.unlock();
+				}
+			}
+		};
+		// Scope of RunPhysicsUpdateSystem: holds the step lock and flags that job workers don't need to lock
+		struct UpdateScope
+		{
+			PhysicsScene& physics_scene;
+			bool locked = false;
+			UpdateScope(PhysicsScene& scene) : physics_scene(scene)
+			{
+				if (physics_scene.step_thread_running)
+				{
+					physics_scene.step_mutex.lock();
+					locked = true;
+				}
+				physics_scene.update_in_progress = true;
+			}
+			~UpdateScope()
+			{
+				physics_scene.update_in_progress = false;
+				if (locked)
+				{
+					physics_scene.step_mutex.unlock();
+				}
+			}
+		};
+
+		TempAllocator& GetTempAllocator()
+		{
+			//static TempAllocatorImpl temp_allocator(10 * 1024 * 1024);
+			static TempAllocatorMalloc temp_allocator; // 10-100 MB was not enough for large simulation, I don't want to reserve more memory up front
+			return temp_allocator;
+		}
+		JobSystem& GetJobSystem()
+		{
+			static JobSystemThreadPool job_system(cMaxPhysicsJobs, cMaxPhysicsBarriers, thread::hardware_concurrency() - 1);
+			return job_system;
+		}
 		PhysicsScene& GetPhysicsScene(Scene& scene)
 		{
 			if (scene.physics_scene == nullptr)
@@ -293,6 +486,12 @@ namespace wi::physics
 					physics_scene->object_vs_broadphase_layer_filter,
 					physics_scene->object_vs_object_layer_filter
 				);
+				physics_scene->physics_system.SetContactListener(&physics_scene->sensor_contact_listener);
+
+				PhysicsSettings physics_settings = physics_scene->physics_system.GetPhysicsSettings();
+				physics_settings.mNumVelocitySteps = (uint)SOLVER_VELOCITY_ITERATIONS;
+				physics_settings.mNumPositionSteps = (uint)SOLVER_POSITION_ITERATIONS;
+				physics_scene->physics_system.SetPhysicsSettings(physics_settings);
 
 				scene.physics_scene = physics_scene;
 			}
@@ -351,6 +550,7 @@ namespace wi::physics
 				if (physics_scene == nullptr || bodyID.IsInvalid())
 					return;
 				PhysicsScene* jolt_physics_scene = (PhysicsScene*)physics_scene.get();
+				StepLock step_lock(*jolt_physics_scene);
 				BodyInterface& body_interface = jolt_physics_scene->physics_system.GetBodyInterface(); // locking version because destructor can be called from any thread
 				body_interface.RemoveBody(bodyID);
 				if (character != nullptr)
@@ -409,6 +609,7 @@ namespace wi::physics
 			{
 				if (physics_scene == nullptr || bodyID.IsInvalid())
 					return;
+				StepLock step_lock(*(PhysicsScene*)physics_scene.get());
 				BodyInterface& body_interface = ((PhysicsScene*)physics_scene.get())->physics_system.GetBodyInterface(); // locking version because destructor can be called from any thread
 				body_interface.RemoveBody(bodyID);
 				body_interface.DestroyBody(bodyID);
@@ -435,6 +636,7 @@ namespace wi::physics
 			{
 				if (physics_scene == nullptr)
 					return;
+				StepLock step_lock(*(PhysicsScene*)physics_scene.get());
 				if (constraint != nullptr)
 				{
 					((PhysicsScene*)physics_scene.get())->physics_system.RemoveConstraint(constraint);
@@ -488,6 +690,818 @@ namespace wi::physics
 		const Constraint& GetConstraint(const wi::scene::PhysicsConstraintComponent& physicscomponent)
 		{
 			return *(Constraint*)physicscomponent.physicsobject.get();
+		}
+
+		// Articulated body: tree of rigid bodies connected by joints (robots, mechanisms)
+		//	Bodies and constraints are created directly (not through Jolt's Ragdoll), so that the constraints can be driven as motors
+		struct Articulation
+		{
+			wi::allocator::shared_ptr<void> physics_scene;
+			Entity root_entity = INVALID_ENTITY;
+
+			struct Link
+			{
+				RigidBody rigidbody; // body is owned by this, user data of the Jolt body points to this (compatible with the rest of the system)
+				Entity entity = INVALID_ENTITY;
+				int parent = -1; // index into links
+				ArticulationLinkComponent::JointType joint_type = ArticulationLinkComponent::JointType::Fixed;
+				Ref<TwoBodyConstraint> joint; // joint to parent (nullptr for root)
+				float angle_offset = 0; // joint position at creation (Jolt's zero)
+				Vec3 axis_local_parent = Vec3::sAxisX(); // joint axis in the parent body's rotation frame
+				float feedforward = 0; // torque applied in every simulation step
+				float friction = 0; // Coulomb friction of the joint [N*m], emulated by the step listener while the motor is driving
+				float friction_velocity = 0.05f; // rad/s, joint speed at which the emulated friction reaches its full value
+				bool motor_driving = false; // the hinge motor is in Position or Velocity mode (Jolt then ignores its own max friction torque)
+				wi::vector<std::unique_ptr<ContactAccumulator>> sensors; // indexed by sensor_id
+				float mass = 0;
+				Vec3 prev_com_velocity = Vec3::sZero();
+				bool has_prev_com_velocity = false;
+				Vec3 joint_force = Vec3::sZero(); // force from the joint on this link (world space), last step
+
+				// Measured every step (ArticulationPostStep), copied to the component in RunPhysicsUpdateSystem:
+				float position = 0;
+				float velocity = 0;
+				float motor_force = 0;
+				float limit_force = 0;
+				Vec3 external_force = Vec3::sZero();
+				wi::vector<ArticulationLinkComponent::ContactSensor> contact_snapshot; // indexed by sensor_id
+			};
+			wi::vector<std::unique_ptr<Link>> links; // parent-first order, links[0] is root
+
+			// Step callback interface:
+			bool external_drive = false; // true when a step callback provided drive commands, the component drive parameters are ignored then
+			wi::vector<wi::physics::ArticulationLinkCommand> commands; // by link index
+			wi::physics::ArticulationStepState step_state; // reused buffer for the callback
+
+			// Measured every step:
+			Vec3 root_linear_velocity = Vec3::sZero();
+			Vec3 root_angular_velocity = Vec3::sZero();
+			Vec3 root_linear_acceleration = Vec3::sZero();
+			wi::vector<Vec3> external_forces_scratch;
+
+			Ref<GroupFilterTable> group_filter;
+
+			struct StepListener : public PhysicsStepListener
+			{
+				Articulation* owner = nullptr;
+				void OnStep(const PhysicsStepListenerContext& inContext) override
+				{
+					BodyInterface& body_interface = inContext.mPhysicsSystem->GetBodyInterfaceNoLock();
+					for (auto& link : owner->links)
+					{
+						for (auto& sensor : link->sensors)
+						{
+							sensor->Reset(); // contacts will be accumulated fresh in this step
+						}
+						if (link->parent < 0 || link->joint_type != ArticulationLinkComponent::JointType::Revolute)
+							continue;
+						// Coulomb friction: Jolt's HingeConstraint applies mMaxFrictionTorque only while the motor is off, so emulate it here
+						//	as a damper saturated at the friction torque. The saturation velocity keeps it well behaved around zero velocity
+						//	(a hard sign() would chatter); below it the joint sees a stiff damper, above it a constant opposing torque
+						float friction_torque = 0;
+						if (link->friction > 0 && link->motor_driving && link->friction_velocity > 0)
+						{
+							friction_torque = -link->friction * std::min(1.0f, std::max(-1.0f, link->velocity / link->friction_velocity));
+						}
+						const float total = link->feedforward + friction_torque;
+						if (total == 0)
+							continue;
+						const Link& parent = *owner->links[link->parent];
+						const Vec3 axis_world = body_interface.GetRotation(parent.rigidbody.bodyID) * link->axis_local_parent;
+						const Vec3 torque = axis_world * total;
+						body_interface.AddTorque(link->rigidbody.bodyID, torque, EActivation::DontActivate);
+						body_interface.AddTorque(parent.rigidbody.bodyID, -torque, EActivation::DontActivate);
+					}
+				}
+			} step_listener;
+			bool step_listener_added = false;
+
+			// for root acceleration:
+			Vec3 prev_root_velocity = Vec3::sZero();
+			bool has_prev_root_velocity = false;
+
+			~Articulation()
+			{
+				if (physics_scene == nullptr)
+					return;
+				PhysicsScene& scene = *(PhysicsScene*)physics_scene.get();
+				StepLock step_lock(scene);
+				for (size_t i = 0; i < scene.articulations.size(); ++i)
+				{
+					if (scene.articulations[i] == this)
+					{
+						scene.articulations[i] = scene.articulations.back();
+						scene.articulations.pop_back();
+						break;
+					}
+				}
+				PhysicsSystem& physics_system = scene.physics_system;
+				if (step_listener_added)
+				{
+					physics_system.RemoveStepListener(&step_listener);
+					step_listener_added = false;
+				}
+				for (auto& link : links)
+				{
+					if (link->joint != nullptr)
+					{
+						physics_system.RemoveConstraint(link->joint);
+						link->joint = nullptr;
+					}
+				}
+				links.clear(); // RigidBody destructors remove and destroy the bodies
+			}
+		};
+
+		Articulation& GetArticulation(wi::scene::ArticulationComponent& physicscomponent)
+		{
+			if (physicscomponent.physicsobject == nullptr)
+			{
+				physicscomponent.physicsobject = wi::allocator::make_shared<Articulation>();
+			}
+			return *(Articulation*)physicscomponent.physicsobject.get();
+		}
+		const Articulation& GetArticulation(const wi::scene::ArticulationComponent& physicscomponent)
+		{
+			return *(Articulation*)physicscomponent.physicsobject.get();
+		}
+
+		// Applies drive parameters to a link's joint motor (revolute joints only) and its feedforward torque
+		void ApplyLinkDrive(Articulation::Link& link, const wi::physics::ArticulationLinkCommand& cmd)
+		{
+			link.feedforward = cmd.feedforward_force;
+			if (link.joint == nullptr || link.joint_type != ArticulationLinkComponent::JointType::Revolute)
+				return;
+			HingeConstraint* hinge = (HingeConstraint*)link.joint.GetPtr();
+
+			float stiffness = std::max(0.0f, cmd.stiffness);
+			float target_position = cmd.target_position - link.angle_offset;
+			if (stiffness <= 0 && cmd.damping > 0)
+			{
+				// Pure damping (Kp = 0, Kd > 0): Jolt's position motor needs a spring, so use a negligible stiffness around the current angle
+				stiffness = 1e-4f;
+				target_position = hinge->GetCurrentAngle();
+			}
+
+			MotorSettings& motor_settings = hinge->GetMotorSettings();
+			motor_settings.mSpringSettings.mMode = ESpringMode::StiffnessAndDamping;
+			motor_settings.mSpringSettings.mStiffness = stiffness;
+			motor_settings.mSpringSettings.mDamping = std::max(0.0f, cmd.damping);
+			motor_settings.SetTorqueLimit(std::max(0.0f, cmd.max_force));
+
+			if (stiffness > 0)
+			{
+				if (hinge->GetMotorState() != EMotorState::Position)
+				{
+					hinge->SetMotorState(EMotorState::Position);
+				}
+				hinge->SetTargetAngle(target_position);
+			}
+			else if (cmd.target_velocity != 0)
+			{
+				if (hinge->GetMotorState() != EMotorState::Velocity)
+				{
+					hinge->SetMotorState(EMotorState::Velocity);
+				}
+				hinge->SetTargetAngularVelocity(cmd.target_velocity);
+			}
+			else if (hinge->GetMotorState() != EMotorState::Off)
+			{
+				hinge->SetMotorState(EMotorState::Off);
+			}
+			// With the motor off Jolt applies the constraint's own friction torque, otherwise the step listener emulates it
+			link.motor_driving = hinge->GetMotorState() != EMotorState::Off;
+		}
+
+		// Before a simulation step: apply the drive commands given by the step callback
+		void ArticulationPreStep(Articulation& articulation)
+		{
+			if (!articulation.external_drive)
+				return;
+			for (size_t l = 0; l < articulation.links.size() && l < articulation.commands.size(); ++l)
+			{
+				ApplyLinkDrive(*articulation.links[l], articulation.commands[l]);
+			}
+		}
+
+		// After a simulation step: measure joint states, joint forces, external force estimates, root state, then call the step callback
+		void ArticulationPostStep(PhysicsScene& physics_scene, Articulation& articulation, float dt)
+		{
+			if (articulation.links.empty())
+				return;
+			const BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
+			const Vec3 gravity = physics_scene.physics_system.GetGravity();
+
+			for (auto& link_ptr : articulation.links)
+			{
+				Articulation::Link& link = *link_ptr;
+				if (link.rigidbody.bodyID.IsInvalid())
+					continue;
+
+				link.contact_snapshot.resize(link.sensors.size());
+				for (size_t s = 0; s < link.sensors.size(); ++s)
+				{
+					ContactAccumulator& sensor = *link.sensors[s];
+					sensor.lock.lock();
+					link.contact_snapshot[s].force = cast(sensor.force);
+					link.contact_snapshot[s].contact_count = sensor.count;
+					sensor.lock.unlock();
+				}
+
+				// Joint state and constraint force (impulse of the last step on this link, converted to force):
+				link.joint_force = Vec3::sZero();
+				if (link.joint != nullptr && link.parent >= 0)
+				{
+					if (link.joint_type == ArticulationLinkComponent::JointType::Revolute)
+					{
+						const HingeConstraint* hinge = (const HingeConstraint*)link.joint.GetPtr();
+						const Articulation::Link& parent = *articulation.links[link.parent];
+						const Vec3 axis_world = body_interface.GetRotation(parent.rigidbody.bodyID) * link.axis_local_parent;
+						const Vec3 angular_velocity_child = body_interface.GetAngularVelocity(link.rigidbody.bodyID);
+						const Vec3 angular_velocity_parent = body_interface.GetAngularVelocity(parent.rigidbody.bodyID);
+						link.position = hinge->GetCurrentAngle() + link.angle_offset;
+						link.velocity = (angular_velocity_child - angular_velocity_parent).Dot(axis_world);
+						link.motor_force = hinge->GetTotalLambdaMotor() / dt;
+						link.limit_force = hinge->GetTotalLambdaRotationLimits() / dt;
+						link.joint_force = hinge->GetTotalLambdaPosition() / dt;
+					}
+					else
+					{
+						const FixedConstraint* fixed = (const FixedConstraint*)link.joint.GetPtr();
+						link.joint_force = fixed->GetTotalLambdaPosition() / dt;
+					}
+				}
+			}
+
+			// External force estimate per link: m * (a - g) - F_joint_in + sum(F_joint_out of children)
+			//	(joint impulses act on the child body with positive sign, the parent receives the opposite)
+			{
+				wi::vector<Vec3>& external_forces = articulation.external_forces_scratch;
+				external_forces.resize(articulation.links.size());
+				for (auto& f : external_forces)
+				{
+					f = Vec3::sZero();
+				}
+				for (size_t l = 0; l < articulation.links.size(); ++l)
+				{
+					Articulation::Link& link = *articulation.links[l];
+					if (link.rigidbody.bodyID.IsInvalid())
+						continue;
+					const Vec3 com_velocity = body_interface.GetLinearVelocity(link.rigidbody.bodyID);
+					if (link.has_prev_com_velocity && link.mass > 0)
+					{
+						const Vec3 acceleration = (com_velocity - link.prev_com_velocity) / dt;
+						external_forces[l] += (acceleration - gravity) * link.mass;
+					}
+					link.prev_com_velocity = com_velocity;
+					link.has_prev_com_velocity = true;
+					if (link.parent >= 0)
+					{
+						external_forces[l] -= link.joint_force;
+						external_forces[link.parent] += link.joint_force;
+					}
+				}
+				for (size_t l = 0; l < articulation.links.size(); ++l)
+				{
+					articulation.links[l]->external_force = external_forces[l];
+				}
+			}
+
+			// Root state:
+			const Articulation::Link& root = *articulation.links[0];
+			Mat44 root_mat = Mat44::sIdentity();
+			if (!root.rigidbody.bodyID.IsInvalid())
+			{
+				root_mat = body_interface.GetWorldTransform(root.rigidbody.bodyID);
+				const Vec3 linear_velocity = body_interface.GetPointVelocity(root.rigidbody.bodyID, root_mat.GetTranslation());
+				articulation.root_linear_velocity = linear_velocity;
+				articulation.root_angular_velocity = body_interface.GetAngularVelocity(root.rigidbody.bodyID);
+				if (articulation.has_prev_root_velocity)
+				{
+					articulation.root_linear_acceleration = (linear_velocity - articulation.prev_root_velocity) / dt - gravity;
+				}
+				articulation.prev_root_velocity = linear_velocity;
+				articulation.has_prev_root_velocity = true;
+			}
+
+			// Step callback:
+			auto it = physics_scene.articulation_callbacks.find(articulation.root_entity);
+			if (it == physics_scene.articulation_callbacks.end() || !it->second)
+			{
+				articulation.external_drive = false;
+				return;
+			}
+			wi::physics::ArticulationStepState& state = articulation.step_state;
+			state.time = physics_scene.sim_time;
+			state.step = physics_scene.step_count;
+			state.dt = dt;
+			state.root_position = cast(root_mat.GetTranslation());
+			state.root_rotation = cast(root_mat.GetQuaternion().Normalized());
+			state.root_linear_velocity = cast(articulation.root_linear_velocity);
+			state.root_angular_velocity = cast(articulation.root_angular_velocity);
+			state.root_linear_acceleration = cast(articulation.root_linear_acceleration);
+			state.links.resize(articulation.links.size());
+			for (size_t l = 0; l < articulation.links.size(); ++l)
+			{
+				const Articulation::Link& link = *articulation.links[l];
+				wi::physics::ArticulationStepState::Link& out = state.links[l];
+				out.entity = link.entity;
+				out.position = link.position;
+				out.velocity = link.velocity;
+				out.motor_force = link.motor_force;
+				out.limit_force = link.limit_force;
+				out.joint_force = cast(link.joint_force);
+				out.external_force = cast(link.external_force);
+				out.contacts.resize(link.contact_snapshot.size());
+				for (size_t s = 0; s < link.contact_snapshot.size(); ++s)
+				{
+					out.contacts[s].force = link.contact_snapshot[s].force;
+					out.contacts[s].count = link.contact_snapshot[s].contact_count;
+				}
+			}
+			articulation.commands.resize(articulation.links.size());
+			it->second(state, articulation.commands);
+			articulation.external_drive = true;
+		}
+
+		// One simulation step of the physics scene, with the articulation step interface around it
+		void StepPhysicsScene(PhysicsScene& physics_scene, TempAllocator& temp_allocator, JobSystem& job_system)
+		{
+			for (Articulation* articulation : physics_scene.articulations)
+			{
+				ArticulationPreStep(*articulation);
+			}
+			physics_scene.physics_system.Update(TIMESTEP, COLLISION_STEPS, &temp_allocator, &job_system);
+			physics_scene.sim_time += TIMESTEP;
+			physics_scene.step_count++;
+			for (Articulation* articulation : physics_scene.articulations)
+			{
+				ArticulationPostStep(physics_scene, *articulation, TIMESTEP);
+			}
+		}
+
+		// Asynchronous simulation thread: steps the physics scene at TIMESTEP intervals of wall clock time
+		void StepThreadMain(PhysicsScene* physics_scene)
+		{
+			using clock = std::chrono::steady_clock;
+			bool synced = false;
+			clock::time_point next = clock::now();
+			while (!physics_scene->step_thread_quit)
+			{
+				if (!IsSimulationEnabled())
+				{
+					synced = false; // schedule is rebuilt when resuming
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+					continue;
+				}
+				const auto period = std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(TIMESTEP));
+				if (!synced)
+				{
+					next = clock::now();
+					synced = true;
+				}
+
+				const clock::time_point step_begin = clock::now();
+				{
+					std::lock_guard<std::recursive_mutex> lock(physics_scene->step_mutex);
+					StepPhysicsScene(*physics_scene, *physics_scene->step_thread_temp_allocator, *physics_scene->step_thread_job_system);
+					physics_scene->steps_since_readback++;
+				}
+				const clock::time_point step_end = clock::now();
+				const double step_ms = std::chrono::duration<double, std::milli>(step_end - step_begin).count();
+				physics_scene->stat_step_ms_acc = physics_scene->stat_step_ms_acc + step_ms;
+				physics_scene->stat_step_count++;
+				if (step_ms > physics_scene->stat_step_ms_max)
+				{
+					physics_scene->stat_step_ms_max = step_ms;
+				}
+
+				// Real time pacing:
+				next += period;
+				const double lag_ms = std::chrono::duration<double, std::milli>(step_end - next).count(); // positive: behind schedule
+				physics_scene->stat_wall_lag_ms = lag_ms;
+				if (lag_ms > TIMESTEP * ACCURACY * 1000.0)
+				{
+					// Fell behind too much (blocked by a long update, or the machine is too slow): drop the lost time, restart the schedule
+					physics_scene->stat_resync_count++;
+					synced = false;
+				}
+				else if (lag_ms < 0)
+				{
+					std::this_thread::sleep_until(next);
+				}
+			}
+		}
+
+		// Collects the link entities that belong to the articulation rooted at root_entity, in parent-first order
+		//	Returns false if the tree is invalid (root has no link component, missing parents, cycles)
+		bool CollectArticulationLinks(const wi::scene::Scene& scene, Entity root_entity, wi::vector<Entity>& link_entities, wi::vector<int>& parent_indices)
+		{
+			link_entities.clear();
+			parent_indices.clear();
+			if (!scene.articulation_links.Contains(root_entity))
+				return false;
+			link_entities.push_back(root_entity);
+			parent_indices.push_back(-1);
+
+			// Breadth first traversal of the tree, children are looked up by scanning the component manager (link counts are small):
+			for (size_t i = 0; i < link_entities.size(); ++i)
+			{
+				const Entity parent_entity = link_entities[i];
+				for (size_t j = 0; j < scene.articulation_links.GetCount(); ++j)
+				{
+					const ArticulationLinkComponent& link = scene.articulation_links[j];
+					if (link.parent != parent_entity)
+						continue;
+					const Entity child_entity = scene.articulation_links.GetEntity(j);
+					if (child_entity == root_entity)
+						return false; // cycle
+					bool duplicate = false;
+					for (Entity e : link_entities)
+					{
+						if (e == child_entity)
+						{
+							duplicate = true;
+							break;
+						}
+					}
+					if (duplicate)
+						return false; // cycle
+					link_entities.push_back(child_entity);
+					parent_indices.push_back((int)i);
+				}
+			}
+			return true;
+		}
+
+		Mat44 InertiaTensorToMat44(const XMFLOAT3X3& inertia)
+		{
+			Mat44 result = Mat44::sIdentity();
+			result(0, 0) = inertia._11; result(0, 1) = inertia._12; result(0, 2) = inertia._13;
+			result(1, 0) = inertia._21; result(1, 1) = inertia._22; result(1, 2) = inertia._23;
+			result(2, 0) = inertia._31; result(2, 1) = inertia._32; result(2, 2) = inertia._33;
+			return result;
+		}
+
+		void AddArticulation(
+			wi::scene::Scene& scene,
+			Entity root_entity,
+			wi::scene::ArticulationComponent& physicscomponent
+		)
+		{
+			wi::vector<Entity> link_entities;
+			wi::vector<int> parent_indices;
+			if (!CollectArticulationLinks(scene, root_entity, link_entities, parent_indices))
+			{
+				wilog_warning("AddArticulation: invalid link tree for root entity %u (root has no ArticulationLinkComponent, or there is a cycle)", (uint32_t)root_entity);
+				return;
+			}
+
+			physicscomponent.physicsobject.reset(); // delete previous
+			Articulation& articulation = GetArticulation(physicscomponent);
+			PhysicsScene& physics_scene = GetPhysicsScene(scene);
+			articulation.physics_scene = scene.physics_scene;
+			{
+				PhysicsScene& physics_scene_ref = GetPhysicsScene(scene);
+				bool registered = false;
+				for (Articulation* a : physics_scene_ref.articulations)
+				{
+					if (a == &articulation)
+					{
+						registered = true;
+						break;
+					}
+				}
+				if (!registered)
+				{
+					physics_scene_ref.articulations.push_back(&articulation);
+				}
+			}
+			articulation.root_entity = root_entity;
+			articulation.step_listener.owner = &articulation;
+
+			const uint32_t link_count = (uint32_t)link_entities.size();
+			articulation.group_filter = new GroupFilterTable(link_count);
+			const CollisionGroup::GroupID group_id = collisionGroupID.fetch_add(1);
+			for (uint32_t i = 0; i < link_count; ++i)
+			{
+				if (physicscomponent.IsSelfCollisionAllDisabled())
+				{
+					for (uint32_t j = 0; j < i; ++j)
+					{
+						articulation.group_filter->DisableCollision(i, j);
+					}
+				}
+				else if (parent_indices[i] >= 0)
+				{
+					articulation.group_filter->DisableCollision(i, (uint32_t)parent_indices[i]);
+				}
+			}
+
+			BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterface(); // locking version because this is called from job system!
+			const float convexRadius = 0.001f;
+
+			// Create bodies:
+			wi::vector<Body*> bodies(link_count);
+			for (uint32_t i = 0; i < link_count; ++i)
+			{
+				bodies[i] = nullptr;
+				const Entity entity = link_entities[i];
+				const ArticulationLinkComponent* linkcomponent = scene.articulation_links.GetComponent(entity);
+				const TransformComponent* transform = scene.transforms.GetComponent(entity);
+				if (linkcomponent == nullptr || transform == nullptr)
+				{
+					wilog_warning("AddArticulation: link entity %u has no TransformComponent", (uint32_t)entity);
+					continue;
+				}
+
+				articulation.links.push_back(std::make_unique<Articulation::Link>());
+				Articulation::Link& link = *articulation.links.back();
+				link.entity = entity;
+				link.parent = parent_indices[i];
+				link.joint_type = linkcomponent->joint_type;
+				link.rigidbody.physics_scene = scene.physics_scene;
+				link.rigidbody.entity = entity;
+
+				// Sensor accumulators:
+				int32_t max_sensor_id = -1;
+				for (const ArticulationLinkComponent::Shape& shape : linkcomponent->shapes)
+				{
+					max_sensor_id = std::max(max_sensor_id, shape.sensor_id);
+				}
+				for (int32_t s = 0; s <= max_sensor_id; ++s)
+				{
+					link.sensors.push_back(std::make_unique<ContactAccumulator>());
+				}
+
+				// Compound shape:
+				Ref<StaticCompoundShapeSettings> compound_settings = new StaticCompoundShapeSettings;
+				for (const ArticulationLinkComponent::Shape& shape : linkcomponent->shapes)
+				{
+					ShapeSettings::ShapeResult shape_result;
+					switch (shape.type)
+					{
+					default:
+					case RigidBodyPhysicsComponent::CollisionShape::BOX:
+					{
+						const Vec3 halfextents = cast(shape.halfextents);
+						BoxShapeSettings settings(halfextents, std::min(convexRadius, halfextents.ReduceMin()));
+						settings.SetEmbedded();
+						shape_result = settings.Create();
+					}
+					break;
+					case RigidBodyPhysicsComponent::CollisionShape::SPHERE:
+					{
+						SphereShapeSettings settings(shape.radius);
+						settings.SetEmbedded();
+						shape_result = settings.Create();
+					}
+					break;
+					case RigidBodyPhysicsComponent::CollisionShape::CAPSULE:
+					{
+						CapsuleShapeSettings settings(shape.height * 0.5f, shape.radius);
+						settings.SetEmbedded();
+						shape_result = settings.Create();
+					}
+					break;
+					case RigidBodyPhysicsComponent::CollisionShape::CYLINDER:
+					{
+						CylinderShapeSettings settings(shape.height * 0.5f, shape.radius, std::min(convexRadius, std::min(shape.height * 0.5f, shape.radius)));
+						settings.SetEmbedded();
+						shape_result = settings.Create();
+					}
+					break;
+					}
+					if (shape_result.HasError())
+					{
+						wilog_warning("AddArticulation: shape creation error on link entity %u: %s", (uint32_t)entity, shape_result.GetError().c_str());
+						continue;
+					}
+					Ref<Shape> leaf = shape_result.Get();
+					if (shape.sensor_id >= 0)
+					{
+						leaf->SetUserData((uint64_t)link.sensors[shape.sensor_id].get());
+					}
+					compound_settings->AddShape(cast(shape.position), cast(shape.rotation).Normalized(), leaf.GetPtr());
+				}
+				if (compound_settings->mSubShapes.empty())
+				{
+					// A link without collision shapes: use a tiny sphere that doesn't collide (GHOST layer would disable all collision, but we want the mass, so make a small sphere)
+					SphereShapeSettings settings(0.005f);
+					settings.SetEmbedded();
+					compound_settings->AddShape(Vec3::sZero(), Quat::sIdentity(), settings.Create().Get());
+				}
+				ShapeSettings::ShapeResult compound_result = compound_settings->Create();
+				if (compound_result.HasError())
+				{
+					wilog_warning("AddArticulation: compound shape creation error on link entity %u: %s", (uint32_t)entity, compound_result.GetError().c_str());
+					articulation.links.pop_back();
+					continue;
+				}
+				ShapeRefC shape = compound_result.Get();
+
+				// Center of mass placement:
+				const Vec3 geometric_com = shape->GetCenterOfMass();
+				const Vec3 wanted_com = cast(linkcomponent->center_of_mass);
+				if (!(wanted_com - geometric_com).IsNearZero(1e-10f))
+				{
+					OffsetCenterOfMassShapeSettings offset_settings(wanted_com - geometric_com, shape.GetPtr());
+					offset_settings.SetEmbedded();
+					ShapeSettings::ShapeResult offset_result = offset_settings.Create();
+					if (!offset_result.HasError())
+					{
+						shape = offset_result.Get();
+					}
+				}
+				link.rigidbody.shape = shape;
+
+				// World pose of the link frame:
+				scene.locker.lock();
+				XMMATRIX parentMatrix = scene.ComputeParentMatrixRecursive(entity);
+				scene.locker.unlock();
+				XMStoreFloat4x4(&link.rigidbody.parentMatrix, parentMatrix);
+				XMStoreFloat4x4(&link.rigidbody.parentMatrixInverse, XMMatrixInverse(nullptr, parentMatrix));
+				XMFLOAT4X4 worldMatrix;
+				XMStoreFloat4x4(&worldMatrix, transform->GetLocalMatrix() * parentMatrix);
+				const Mat44 mat = cast(worldMatrix);
+				link.rigidbody.prev_position = mat.GetTranslation();
+				link.rigidbody.prev_rotation = mat.GetQuaternion().Normalized();
+				link.rigidbody.initial_position = link.rigidbody.prev_position;
+				link.rigidbody.initial_rotation = link.rigidbody.prev_rotation;
+
+				const bool is_static = (i == 0) && physicscomponent.IsFixBase();
+				const EMotionType motionType = is_static ? EMotionType::Static : EMotionType::Dynamic;
+
+				BodyCreationSettings settings(
+					shape.GetPtr(),
+					link.rigidbody.prev_position,
+					link.rigidbody.prev_rotation,
+					motionType,
+					is_static ? Layers::NON_MOVING : Layers::MOVING
+				);
+				settings.mRestitution = linkcomponent->restitution;
+				settings.mFriction = linkcomponent->friction;
+				settings.mLinearDamping = 0;
+				settings.mAngularDamping = 0;
+				settings.mAllowSleeping = false;
+				settings.mMotionQuality = cMotionQuality;
+				settings.mUserData = (uint64_t)&link.rigidbody;
+				settings.mCollisionGroup = CollisionGroup(articulation.group_filter, group_id, (CollisionGroup::SubGroupID)i);
+				settings.mNumVelocityStepsOverride = (uint)physicscomponent.velocity_iterations;
+				settings.mNumPositionStepsOverride = (uint)physicscomponent.position_iterations;
+
+				float mass = linkcomponent->mass;
+				if (mass <= 0)
+				{
+					wilog_warning("AddArticulation: link entity %u has non-positive mass, clamped to 0.001 kg", (uint32_t)entity);
+					mass = 0.001f;
+				}
+				Mat44 inertia = InertiaTensorToMat44(linkcomponent->inertia);
+				if (linkcomponent->armature > 0 && link.parent >= 0 && linkcomponent->joint_type == ArticulationLinkComponent::JointType::Revolute)
+				{
+					// Approximate rotor inertia by adding inertia around the joint axis (expressed in child link frame):
+					const Vec3 axis_child = (cast(linkcomponent->joint_rotation_child).Normalized() * cast(linkcomponent->axis)).Normalized();
+					for (int r = 0; r < 3; ++r)
+					{
+						for (int c = 0; c < 3; ++c)
+						{
+							inertia(r, c) += linkcomponent->armature * axis_child[r] * axis_child[c];
+						}
+					}
+				}
+				settings.mOverrideMassProperties = EOverrideMassProperties::MassAndInertiaProvided;
+				settings.mMassPropertiesOverride.mMass = mass;
+				settings.mMassPropertiesOverride.mInertia = inertia;
+				link.mass = is_static ? 0 : mass;
+
+				link.rigidbody.friction = settings.mFriction;
+				link.rigidbody.restitution = settings.mRestitution;
+				link.rigidbody.motiontype = settings.mMotionType;
+
+				Body* body = body_interface.CreateBody(settings);
+				if (body == nullptr)
+				{
+					wilog_warning("AddArticulation: body creation failed on link entity %u", (uint32_t)entity);
+					articulation.links.pop_back();
+					continue;
+				}
+				link.rigidbody.bodyID = body->GetID();
+				body_interface.AddBody(link.rigidbody.bodyID, EActivation::Activate);
+				bodies[i] = body;
+			}
+
+			if (articulation.links.size() != link_count)
+			{
+				wilog_warning("AddArticulation: some links could not be created, articulation of root entity %u is not created", (uint32_t)root_entity);
+				physicscomponent.physicsobject.reset();
+				return;
+			}
+
+			// Create joints:
+			for (uint32_t i = 1; i < link_count; ++i)
+			{
+				Articulation::Link& link = *articulation.links[i];
+				const Articulation::Link& parent = *articulation.links[link.parent];
+				const ArticulationLinkComponent* linkcomponent = scene.articulation_links.GetComponent(link.entity);
+				Body& body_parent = *bodies[link.parent];
+				Body& body_child = *bodies[i];
+
+				const Quat rot_parent = body_parent.GetRotation();
+				const Quat rot_child = body_child.GetRotation();
+				const Vec3 com_parent = body_parent.GetShape()->GetCenterOfMass();
+				const Vec3 com_child = body_child.GetShape()->GetCenterOfMass();
+
+				// Joint frame in the parent and child link frames:
+				const Vec3 joint_pos_parent = cast(linkcomponent->joint_position_parent);
+				const Quat joint_rot_parent = cast(linkcomponent->joint_rotation_parent).Normalized();
+				const Vec3 joint_pos_child = cast(linkcomponent->joint_position_child);
+
+				// Consistency check: the joint points should coincide in world space at creation
+				{
+					const Vec3 joint_world_from_parent = body_parent.GetWorldTransform() * joint_pos_parent;
+					const Vec3 joint_world_from_child = body_child.GetWorldTransform() * joint_pos_child;
+					const float mismatch = (joint_world_from_parent - joint_world_from_child).Length();
+					if (mismatch > 0.001f)
+					{
+						wilog_warning("AddArticulation: joint position mismatch of %f m between parent and child frames on link entity %u (link transforms are not consistent with the joint frames)", mismatch, (uint32_t)link.entity);
+					}
+				}
+
+				switch (linkcomponent->joint_type)
+				{
+				case ArticulationLinkComponent::JointType::Revolute:
+				{
+					HingeConstraintSettings settings;
+					settings.SetEmbedded();
+					settings.mSpace = EConstraintSpace::LocalToBodyCOM;
+					settings.mPoint1 = joint_pos_parent - com_parent;
+					settings.mHingeAxis1 = (joint_rot_parent * cast(linkcomponent->axis)).Normalized();
+					settings.mNormalAxis1 = settings.mHingeAxis1.GetNormalizedPerpendicular();
+					// Child side axes: the hinge zero angle is where the frames coincide, we want that at the creation pose:
+					const Quat parent_to_child = rot_child.Conjugated() * rot_parent;
+					settings.mPoint2 = joint_pos_child - com_child;
+					settings.mHingeAxis2 = (parent_to_child * settings.mHingeAxis1).Normalized();
+					settings.mNormalAxis2 = (parent_to_child * settings.mNormalAxis1).Normalized();
+
+					link.angle_offset = linkcomponent->initial_position;
+					link.axis_local_parent = settings.mHingeAxis1;
+
+					// Limits relative to the creation pose:
+					const bool has_limits = linkcomponent->limit_min > -XM_PI || linkcomponent->limit_max < XM_PI;
+					if (has_limits)
+					{
+						float limit_min = linkcomponent->limit_min - link.angle_offset;
+						float limit_max = linkcomponent->limit_max - link.angle_offset;
+						if (limit_min > 0 || limit_max < 0 || limit_min < -XM_PI || limit_max > XM_PI)
+						{
+							wilog_warning("AddArticulation: joint limits [%f, %f] of link entity %u are clamped to [-PI, 0] / [0, PI] relative to initial_position %f", linkcomponent->limit_min, linkcomponent->limit_max, (uint32_t)link.entity, link.angle_offset);
+						}
+						settings.mLimitsMin = clamp(limit_min, -XM_PI, 0.0f);
+						settings.mLimitsMax = clamp(limit_max, 0.0f, XM_PI);
+						if (settings.mLimitsMin == settings.mLimitsMax)
+						{
+							settings.mLimitsMax = settings.mLimitsMin + 1e-3f;
+						}
+					}
+					settings.mMaxFrictionTorque = linkcomponent->joint_friction;
+					link.friction = std::max(0.0f, linkcomponent->joint_friction);
+					link.friction_velocity = std::max(0.0f, linkcomponent->joint_friction_velocity);
+					settings.mMotorSettings.mSpringSettings = SpringSettings(ESpringMode::StiffnessAndDamping, std::max(0.0f, linkcomponent->drive.stiffness), std::max(0.0f, linkcomponent->drive.damping));
+					settings.mMotorSettings.SetTorqueLimit(linkcomponent->drive.max_force);
+					settings.mNumVelocityStepsOverride = (uint)physicscomponent.velocity_iterations;
+					settings.mNumPositionStepsOverride = (uint)physicscomponent.position_iterations;
+
+					link.joint = settings.Create(body_parent, body_child);
+				}
+				break;
+				case ArticulationLinkComponent::JointType::Prismatic:
+					wilog_warning("AddArticulation: prismatic joint is not implemented in the Jolt backend, link entity %u is fixed to its parent", (uint32_t)link.entity);
+					[[fallthrough]];
+				default:
+				case ArticulationLinkComponent::JointType::Fixed:
+				{
+					FixedConstraintSettings settings;
+					settings.SetEmbedded();
+					settings.mSpace = EConstraintSpace::WorldSpace;
+					settings.mAutoDetectPoint = true;
+					settings.mNumVelocityStepsOverride = (uint)physicscomponent.velocity_iterations;
+					settings.mNumPositionStepsOverride = (uint)physicscomponent.position_iterations;
+					link.joint = settings.Create(body_parent, body_child);
+				}
+				break;
+				}
+
+				if (link.joint != nullptr)
+				{
+					physics_scene.physics_system.AddConstraint(link.joint);
+				}
+			}
+
+			physics_scene.physics_system.AddStepListener(&articulation.step_listener);
+			articulation.step_listener_added = true;
+
+			physicscomponent.link_count = link_count;
+			physicscomponent.SetRefreshParametersNeeded(true); // motors will be refreshed
 		}
 
 		void AddRigidBody(
@@ -2104,13 +3118,18 @@ namespace wi::physics
 		physicsobject.shape = shape_result.Get();
 	}
 
+	const char* GetBackendName()
+	{
+		return "Jolt";
+	}
+
 	bool IsEnabled() { return ENABLED; }
 	void SetEnabled(bool value) { ENABLED = value; }
 
 	bool IsSimulationEnabled() { return ENABLED && SIMULATION_ENABLED; }
 	void SetSimulationEnabled(bool value) { SIMULATION_ENABLED = value; }
 
-	bool IsInterpolationEnabled() { return INTERPOLATION; }
+	bool IsInterpolationEnabled() { return INTERPOLATION && !ASYNC_SIMULATION; }
 	void SetInterpolationEnabled(bool value) { INTERPOLATION = value; }
 
 	bool IsDebugDrawEnabled() { return DEBUGDRAW_ENABLED; }
@@ -2131,6 +3150,53 @@ namespace wi::physics
 	float GetCharacterCollisionTolerance() { return CHARACTER_COLLISION_TOLERANCE; }
 	void SetCharacterCollisionTolerance(float value) { CHARACTER_COLLISION_TOLERANCE = value; }
 
+	void SetSolverIterations(int velocity_iterations, int position_iterations)
+	{
+		SOLVER_VELOCITY_ITERATIONS = std::max(1, velocity_iterations);
+		SOLVER_POSITION_ITERATIONS = std::max(1, position_iterations);
+	}
+	int GetSolverVelocityIterations() { return SOLVER_VELOCITY_ITERATIONS; }
+	int GetSolverPositionIterations() { return SOLVER_POSITION_ITERATIONS; }
+
+	void SetAsyncSimulationEnabled(bool value) { ASYNC_SIMULATION = value; }
+	bool IsAsyncSimulationEnabled() { return ASYNC_SIMULATION; }
+	AsyncSimulationStats GetAsyncSimulationStats(wi::scene::Scene& scene)
+	{
+		AsyncSimulationStats stats;
+		if (scene.physics_scene == nullptr)
+			return stats;
+		PhysicsScene& physics_scene = GetPhysicsScene(scene);
+		stats.sim_time = physics_scene.sim_time;
+		stats.steps = physics_scene.step_count;
+		stats.wall_lag_ms = physics_scene.stat_wall_lag_ms;
+		const uint32_t count = physics_scene.stat_step_count.exchange(0);
+		const double acc = physics_scene.stat_step_ms_acc.exchange(0);
+		stats.step_time_ms_avg = count > 0 ? acc / count : 0;
+		stats.step_time_ms_max = physics_scene.stat_step_ms_max.exchange(0);
+		stats.resync_count = physics_scene.stat_resync_count;
+		return stats;
+	}
+
+	void SetArticulationStepCallback(wi::scene::Scene& scene, Entity root, const ArticulationStepCallback& callback)
+	{
+		PhysicsScene& physics_scene = GetPhysicsScene(scene);
+		StepLock step_lock(physics_scene);
+		if (callback)
+		{
+			physics_scene.articulation_callbacks[root] = callback;
+		}
+		else
+		{
+			physics_scene.articulation_callbacks.erase(root);
+			// The articulation falls back to the component drive parameters at the next step
+			ArticulationComponent* component = scene.articulations.GetComponent(root);
+			if (component != nullptr && component->physicsobject != nullptr)
+			{
+				GetArticulation(*component).external_drive = false;
+			}
+		}
+	}
+
 	void RunPhysicsUpdateSystem(
 		wi::jobsystem::context& ctx,
 		wi::scene::Scene& scene,
@@ -2149,6 +3215,15 @@ namespace wi::physics
 		auto range = wi::profiler::BeginRangeCPU("Physics");
 
 		PhysicsScene& physics_scene = GetPhysicsScene(scene);
+		if (ASYNC_SIMULATION && !physics_scene.step_thread_running)
+		{
+			physics_scene.StartStepThread();
+		}
+		else if (!ASYNC_SIMULATION && physics_scene.step_thread_running)
+		{
+			physics_scene.StopStepThread();
+		}
+		UpdateScope update_scope(physics_scene); // the stepping thread is blocked while this update runs
 		physics_scene.physics_system.SetGravity(cast(scene.weather.gravity));
 
 		if (physics_scene.optimize_broadphase)
@@ -2163,6 +3238,9 @@ namespace wi::physics
 
 			RigidBodyPhysicsComponent& physicscomponent = scene.rigidbodies[args.jobIndex];
 			const Entity entity = scene.rigidbodies.GetEntity(args.jobIndex);
+
+			if (scene.articulation_links.Contains(entity))
+				return; // articulation links create their own bodies
 
 			if ((physicscomponent.physicsobject == nullptr || physicscomponent.IsRefreshParametersNeeded()) && scene.transforms.Contains(entity))
 			{
@@ -2226,6 +3304,40 @@ namespace wi::physics
 		});
 
 		wi::jobsystem::Wait(ctx); // wait for rigidbody creations
+
+		// Articulation creation (serial, the number of articulations is expected to be small):
+		{
+			wi::vector<Entity> link_entities;
+			wi::vector<int> parent_indices;
+			for (size_t i = 0; i < scene.articulations.GetCount(); ++i)
+			{
+				ArticulationComponent& physicscomponent = scene.articulations[i];
+				const Entity root_entity = scene.articulations.GetEntity(i);
+				bool recreate = physicscomponent.physicsobject == nullptr;
+				if (!recreate)
+				{
+					// Detect structural changes (removed or added links):
+					const Articulation& articulation = GetArticulation((const ArticulationComponent&)physicscomponent);
+					for (auto& link : articulation.links)
+					{
+						if (!scene.articulation_links.Contains(link->entity))
+						{
+							recreate = true;
+							break;
+						}
+					}
+					if (!recreate && CollectArticulationLinks(scene, root_entity, link_entities, parent_indices) && link_entities.size() != articulation.links.size())
+					{
+						recreate = true;
+					}
+				}
+				if (recreate)
+				{
+					AddArticulation(scene, root_entity, physicscomponent);
+				}
+			}
+		}
+
 		wi::jobsystem::Dispatch(ctx, (uint32_t)scene.constraints.GetCount(), dispatchGroupSize, [&scene, &physics_scene](wi::jobsystem::JobArgs args) {
 
 			PhysicsConstraintComponent& physicscomponent = scene.constraints[args.jobIndex];
@@ -2846,13 +3958,86 @@ namespace wi::physics
 
 		physics_scene.activate_all_rigid_bodies = false;
 
-		// Perform internal simulation step:
-		if (IsSimulationEnabled())
+		// Articulation drive updates (every frame, non-locking):
+		for (size_t i = 0; i < scene.articulations.GetCount(); ++i)
 		{
-			//static TempAllocatorImpl temp_allocator(10 * 1024 * 1024);
-			static TempAllocatorMalloc temp_allocator; // 10-100 MB was not enough for large simulation, I don't want to reserve more memory up front
-			static JobSystemThreadPool job_system(cMaxPhysicsJobs, cMaxPhysicsBarriers, thread::hardware_concurrency() - 1);
+			ArticulationComponent& physicscomponent = scene.articulations[i];
+			if (physicscomponent.physicsobject == nullptr)
+				continue;
+			Articulation& articulation = GetArticulation(physicscomponent);
+			const bool refresh_all = physicscomponent.IsRefreshParametersNeeded();
+			physicscomponent.SetRefreshParametersNeeded(false);
 
+			for (size_t l = 0; l < articulation.links.size(); ++l)
+			{
+				Articulation::Link& link = *articulation.links[l];
+				ArticulationLinkComponent* linkcomponent = scene.articulation_links.GetComponent(link.entity);
+				if (linkcomponent == nullptr)
+					continue;
+
+				if (articulation.external_drive && l < articulation.commands.size())
+				{
+					// Drive is controlled by the step callback, write back the last command for display:
+					const wi::physics::ArticulationLinkCommand& cmd = articulation.commands[l];
+					linkcomponent->drive.target_position = cmd.target_position;
+					linkcomponent->drive.target_velocity = cmd.target_velocity;
+					linkcomponent->drive.stiffness = cmd.stiffness;
+					linkcomponent->drive.damping = cmd.damping;
+					linkcomponent->drive.max_force = cmd.max_force;
+					linkcomponent->drive.feedforward_force = cmd.feedforward_force;
+				}
+				else
+				{
+					wi::physics::ArticulationLinkCommand cmd;
+					cmd.target_position = linkcomponent->drive.target_position;
+					cmd.target_velocity = linkcomponent->drive.target_velocity;
+					cmd.stiffness = linkcomponent->drive.stiffness;
+					cmd.damping = linkcomponent->drive.damping;
+					cmd.max_force = linkcomponent->drive.max_force;
+					cmd.feedforward_force = linkcomponent->drive.feedforward_force;
+					ApplyLinkDrive(link, cmd);
+				}
+
+				if (link.joint == nullptr || link.joint_type != ArticulationLinkComponent::JointType::Revolute)
+					continue;
+				HingeConstraint* hinge = (HingeConstraint*)link.joint.GetPtr();
+				hinge->SetMaxFrictionTorque(std::max(0.0f, linkcomponent->joint_friction)); // used by Jolt only while the motor is off
+				link.friction = std::max(0.0f, linkcomponent->joint_friction); // the step listener emulates it while the motor is driving
+				link.friction_velocity = std::max(0.0f, linkcomponent->joint_friction_velocity);
+
+				if (refresh_all || linkcomponent->IsRefreshParametersNeeded())
+				{
+					linkcomponent->SetRefreshParametersNeeded(false);
+					const bool has_limits = linkcomponent->limit_min > -XM_PI || linkcomponent->limit_max < XM_PI;
+					if (has_limits)
+					{
+						float limit_min = clamp(linkcomponent->limit_min - link.angle_offset, -XM_PI, 0.0f);
+						float limit_max = clamp(linkcomponent->limit_max - link.angle_offset, 0.0f, XM_PI);
+						if (limit_min == limit_max)
+						{
+							limit_max = limit_min + 1e-3f;
+						}
+						hinge->SetLimits(limit_min, limit_max);
+					}
+					else
+					{
+						hinge->SetLimits(-XM_PI, XM_PI);
+					}
+				}
+			}
+		}
+
+		// Perform internal simulation step:
+		physics_scene.steps_last_frame = 0;
+		if (physics_scene.step_thread_running)
+		{
+			// Asynchronous simulation: the steps were performed by the stepping thread
+			physics_scene.steps_last_frame = (uint32_t)physics_scene.steps_since_readback.exchange(0);
+			physics_scene.accumulator = 0;
+			physics_scene.alpha = 0;
+		}
+		else if (IsSimulationEnabled())
+		{
 			physics_scene.accumulator += dt;
 			physics_scene.accumulator = clamp(physics_scene.accumulator, 0.0f, TIMESTEP * ACCURACY);
 			while (physics_scene.accumulator >= TIMESTEP)
@@ -2937,8 +4122,9 @@ namespace wi::physics
 					wi::jobsystem::Wait(ctx);
 				}
 
-				physics_scene.physics_system.Update(TIMESTEP, COLLISION_STEPS, &temp_allocator, &job_system);
+				StepPhysicsScene(physics_scene, GetTempAllocator(), GetJobSystem());
 				physics_scene.accumulator = next_accumulator;
+				physics_scene.steps_last_frame++;
 			}
 			physics_scene.alpha = physics_scene.accumulator / TIMESTEP;
 		}
@@ -2983,6 +4169,51 @@ namespace wi::physics
 			// Back to local space of parent:
 			transform->MatrixTransform(physicsobject.parentMatrixInverse);
 		});
+
+		// Articulation feedback: link transforms and the states measured in ArticulationPostStep
+		for (size_t i = 0; i < scene.articulations.GetCount(); ++i)
+		{
+			ArticulationComponent& physicscomponent = scene.articulations[i];
+			if (physicscomponent.physicsobject == nullptr)
+				continue;
+			Articulation& articulation = GetArticulation(physicscomponent);
+			if (articulation.links.empty())
+				continue;
+			const BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
+
+			for (auto& link_ptr : articulation.links)
+			{
+				Articulation::Link& link = *link_ptr;
+				if (link.rigidbody.bodyID.IsInvalid())
+					continue;
+
+				if (body_interface.GetMotionType(link.rigidbody.bodyID) == EMotionType::Dynamic)
+				{
+					TransformComponent* transform = scene.transforms.GetComponent(link.entity);
+					if (transform != nullptr)
+					{
+						const Mat44 mat = body_interface.GetWorldTransform(link.rigidbody.bodyID);
+						transform->translation_local = cast(mat.GetTranslation());
+						transform->rotation_local = cast(mat.GetQuaternion().Normalized());
+						transform->MatrixTransform(link.rigidbody.parentMatrixInverse);
+					}
+				}
+
+				ArticulationLinkComponent* linkcomponent = scene.articulation_links.GetComponent(link.entity);
+				if (linkcomponent == nullptr)
+					continue;
+				linkcomponent->contact_sensors = link.contact_snapshot;
+				linkcomponent->position = link.position;
+				linkcomponent->velocity = link.velocity;
+				linkcomponent->force = link.motor_force + link.limit_force;
+				linkcomponent->joint_force = cast(link.joint_force);
+				linkcomponent->external_force = cast(link.external_force);
+			}
+
+			physicscomponent.root_linear_velocity = cast(articulation.root_linear_velocity);
+			physicscomponent.root_angular_velocity = cast(articulation.root_angular_velocity);
+			physicscomponent.root_linear_acceleration = cast(articulation.root_linear_acceleration);
+		}
 
 		wi::jobsystem::Dispatch(ctx, (uint32_t)scene.softbodies.GetCount(), 1, [&scene, &physics_scene](wi::jobsystem::JobArgs args) {
 
@@ -3158,6 +4389,11 @@ namespace wi::physics
 
 				bool ShouldDraw(const Body& inBody) const override
 				{
+					// Skip shapes with a huge triangle count (large height fields / triangle meshes): the wireframe would be millions of lines per frame
+					const Shape* shape = inBody.GetShape();
+					if (shape != nullptr && shape->GetStats().mNumTriangles > DEBUG_MAX_DRAW_TRIANGLES)
+						return false;
+
 					const BodyInterface& body_interface = physics_system.GetBodyInterfaceNoLock();
 					const Vec3 body_pos = body_interface.GetPosition(inBody.GetID());
 					const XMVECTOR body_pos_vec = XMVectorSet(body_pos.GetX(), body_pos.GetY(), body_pos.GetZ(), 0.0f);
@@ -3204,6 +4440,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		physicsobject.prev_position = cast(position);
 		Mat44 m = Mat44::sTranslation(physicsobject.prev_position) * Mat44::sRotation(physicsobject.prev_rotation);
@@ -3232,6 +4469,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		physicsobject.prev_position = cast(position);
 		physicsobject.prev_rotation = cast(rotation).Normalized();
@@ -3260,6 +4498,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.SetLinearVelocity(physicsobject.bodyID, cast(velocity));
 	}
@@ -3277,6 +4516,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.SetAngularVelocity(physicsobject.bodyID, cast(velocity));
 	}
@@ -3291,6 +4531,7 @@ namespace wi::physics
 			return cast(physicsobject.character->GetLinearVelocity());
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		return cast(body_interface.GetLinearVelocity(physicsobject.bodyID));
 	}
@@ -3304,6 +4545,7 @@ namespace wi::physics
 			return cast(physicsobject.character->GetPosition());
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		return cast(body_interface.GetPosition(physicsobject.bodyID));
 	}
@@ -3317,6 +4559,7 @@ namespace wi::physics
 			return cast(physicsobject.character->GetRotation());
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		return cast(body_interface.GetRotation(physicsobject.bodyID));
 	}
@@ -3470,6 +4713,7 @@ namespace wi::physics
 			return;
 		RigidBody& physicsobject = GetRigidBody(physicscomponent);
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.AddForce(physicsobject.bodyID, cast(force));
 	}
@@ -3484,6 +4728,7 @@ namespace wi::physics
 			return;
 		RigidBody& physicsobject = GetRigidBody(physicscomponent);
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		Vec3 at_world = at_local ? body_interface.GetCenterOfMassTransform(physicsobject.bodyID).Inversed() * cast(at) : cast(at);
 		body_interface.AddForce(physicsobject.bodyID, cast(force), at_world);
@@ -3503,6 +4748,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.AddImpulse(physicsobject.bodyID, cast(impulse));
 	}
@@ -3563,6 +4809,7 @@ namespace wi::physics
 			return;
 		RigidBody& physicsobject = ragdoll.rigidbodies[bodypart];
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.SetMotionType(physicsobject.bodyID, EMotionType::Dynamic, EActivation::Activate);
 		body_interface.AddImpulse(physicsobject.bodyID, cast(impulse));
@@ -3583,6 +4830,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		Vec3 at_world = at_local ? body_interface.GetCenterOfMassTransform(physicsobject.bodyID) * cast(at) : cast(at);
 		body_interface.AddImpulse(physicsobject.bodyID, cast(impulse), at_world);
@@ -3646,6 +4894,7 @@ namespace wi::physics
 			return;
 		RigidBody& physicsobject = ragdoll.rigidbodies[bodypart];
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		Vec3 at_world = at_local ? body_interface.GetCenterOfMassTransform(physicsobject.bodyID) * cast(at) : cast(at);
 		body_interface.SetMotionType(physicsobject.bodyID, EMotionType::Dynamic, EActivation::Activate);
@@ -3661,6 +4910,7 @@ namespace wi::physics
 			return;
 		RigidBody& physicsobject = GetRigidBody(physicscomponent);
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.AddTorque(physicsobject.bodyID, cast(torque), EActivation::Activate);
 	}
@@ -3692,6 +4942,7 @@ namespace wi::physics
 		}
 
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		body_interface.ActivateBody(physicsobject.bodyID);
 	}
@@ -3704,6 +4955,7 @@ namespace wi::physics
 		if (physicsobject.vehicle_constraint == nullptr)
 			return 0;
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		float velocity = (body_interface.GetRotation(physicsobject.bodyID).Conjugated() * body_interface.GetLinearVelocity(physicsobject.bodyID)).GetZ();
 		return velocity;
@@ -3803,6 +5055,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		switch (state)
 		{
@@ -3823,6 +5076,7 @@ namespace wi::physics
 	{
 		SoftBody& physicsobject = GetSoftBody(physicscomponent);
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		switch (state)
 		{
@@ -3853,6 +5107,7 @@ namespace wi::physics
 	void ResetPhysicsObjects(Scene& scene)
 	{
 		PhysicsScene& physics_scene = *(PhysicsScene*)scene.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		BodyIDVector bodies;
 		physics_scene.physics_system.GetBodies(bodies);
@@ -3915,6 +5170,7 @@ namespace wi::physics
 			return XMFLOAT3(0, 0, 0);
 
 		const PhysicsScene& physics_scene = *(const PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyLockRead lock(physics_scene.physics_system.GetBodyLockInterfaceNoLock(), physicsobject.bodyID);
 		if (!lock.Succeeded())
 			return XMFLOAT3(0, 0, 0);
@@ -3939,6 +5195,7 @@ namespace wi::physics
 			return;
 		}
 		PhysicsScene& physics_scene = *(PhysicsScene*)physicsobject.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		EMotionType motionType = body_interface.GetMotionType(physicsobject.bodyID);
 		ObjectLayer layer = value ? Layers::GHOST : (motionType == EMotionType::Static ? Layers::NON_MOVING : Layers::MOVING);
@@ -3953,6 +5210,7 @@ namespace wi::physics
 			return;
 		Ragdoll& ragdoll = *(Ragdoll*)humanoid.ragdoll.get();
 		PhysicsScene& physics_scene = *(PhysicsScene*)ragdoll.physics_scene.get();
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 		ObjectLayer layer = value ? Layers::GHOST : Layers::MOVING;
 		for (auto& rb : ragdoll.rigidbodies)
@@ -4031,6 +5289,7 @@ namespace wi::physics
 		collector.scene = &scene;
 		collector.physics_scene = &physics_scene;
 
+		StepLock step_lock(physics_scene);
 		physics_scene.physics_system.GetNarrowPhaseQuery().CastRay(inray, settings, collector);
 		if (!collector.HadHit())
 			return result;
@@ -4093,10 +5352,12 @@ namespace wi::physics
 			if (physics_scene == nullptr || bodyB == nullptr)
 				return;
 			PhysicsScene& physics_scene = *((PhysicsScene*)this->physics_scene.get());
+			StepLock step_lock(physics_scene);
 			BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 			if (bodyA != nullptr)
 			{
 				// Rigid body constraint removal
+				StepLock step_lock(physics_scene);
 				physics_scene.physics_system.RemoveConstraint(constraint);
 				body_interface.RemoveBody(bodyA->GetID());
 				body_interface.DestroyBody(bodyA->GetID());
@@ -4120,6 +5381,7 @@ namespace wi::physics
 		if (scene.physics_scene == nullptr)
 			return;
 		PhysicsScene& physics_scene = *((PhysicsScene*)scene.physics_scene.get());
+		StepLock step_lock(physics_scene);
 		BodyInterface& body_interface = physics_scene.physics_system.GetBodyInterfaceNoLock();
 
 		if (op.IsValid())
@@ -4186,6 +5448,7 @@ namespace wi::physics
 
 				internal_state->bind_distance = (internal_state->bodyA->GetCenterOfMassPosition() - internal_state->bodyB->GetCenterOfMassPosition()).Length();
 
+				StepLock step_lock(physics_scene);
 				physics_scene.physics_system.AddConstraint(internal_state->constraint);
 			}
 			else if (body->IsSoftBody())
