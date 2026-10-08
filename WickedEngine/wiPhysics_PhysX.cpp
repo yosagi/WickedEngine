@@ -1503,6 +1503,198 @@ namespace wi::physics
 		}
 	}
 
+	// Physics debug draw: wireframes of the shapes as PhysX holds them (the cooked geometry and the actual poses), so that what
+	//	the solver collides with can be compared with what is rendered. Shapes farther than DEBUG_MAX_DRAW_DISTANCE from the camera
+	//	and meshes / height fields with more than kDebugMaxTriangles triangles are skipped, like the Jolt backend does.
+	//	Runs on the main thread inside the update (the stepping thread is blocked), wi::renderer::DrawLine is not thread safe
+	static constexpr uint32_t kDebugMaxTriangles = 200000;
+	static void DebugDrawShapes(const Scene& scene, PhysicsScene& physics_scene)
+	{
+		if (physics_scene.scene == nullptr)
+			return;
+		const PxVec3 eye = PxVec3(scene.camera.Eye.x, scene.camera.Eye.y, scene.camera.Eye.z);
+
+		auto line = [](const PxVec3& a, const PxVec3& b, const XMFLOAT4& color) {
+			wi::renderer::RenderableLine l;
+			l.start = XMFLOAT3(a.x, a.y, a.z);
+			l.end = XMFLOAT3(b.x, b.y, b.z);
+			l.color_start = l.color_end = color;
+			wi::renderer::DrawLine(l);
+		};
+		// circle of radius r around the pose's local axis (0 = x, 1 = y, 2 = z), centred at local c
+		auto circle = [&](const PxTransform& pose, const PxVec3& c, float r, int axis, const XMFLOAT4& color, float a0 = 0, float a1 = PxTwoPi) {
+			const int segments = 24;
+			PxVec3 prev(0.0f);
+			for (int k = 0; k <= segments; ++k)
+			{
+				const float a = a0 + (a1 - a0) * k / segments;
+				const float u = r * std::cos(a), v = r * std::sin(a);
+				PxVec3 p = c;
+				if (axis == 0) { p.y += u; p.z += v; }
+				else if (axis == 1) { p.z += u; p.x += v; }
+				else { p.x += u; p.y += v; }
+				p = pose.transform(p);
+				if (k > 0)
+					line(prev, p, color);
+				prev = p;
+			}
+		};
+
+		auto draw_shape = [&](const PxRigidActor& actor, const PxShape& shape, const XMFLOAT4& color) {
+			const PxTransform pose = PxShapeExt::getGlobalPose(shape, actor);
+			if ((pose.p - eye).magnitude() > DEBUG_MAX_DRAW_DISTANCE)
+				return;
+			const PxGeometry& geometry = shape.getGeometry();
+			switch (geometry.getType())
+			{
+			case PxGeometryType::eBOX:
+			{
+				const PxVec3 h = static_cast<const PxBoxGeometry&>(geometry).halfExtents;
+				PxVec3 c[8];
+				for (int k = 0; k < 8; ++k)
+					c[k] = pose.transform(PxVec3(k & 1 ? h.x : -h.x, k & 2 ? h.y : -h.y, k & 4 ? h.z : -h.z));
+				for (int k = 0; k < 8; ++k)
+				{
+					for (int bit = 1; bit < 8; bit <<= 1)
+					{
+						if ((k & bit) == 0)
+							line(c[k], c[k | bit], color);
+					}
+				}
+			}
+			break;
+			case PxGeometryType::eSPHERE:
+			{
+				const float r = static_cast<const PxSphereGeometry&>(geometry).radius;
+				for (int axis = 0; axis < 3; ++axis)
+					circle(pose, PxVec3(0), r, axis, color);
+			}
+			break;
+			case PxGeometryType::eCAPSULE:
+			{
+				// PhysX capsules run along the local x axis
+				const PxCapsuleGeometry& capsule = static_cast<const PxCapsuleGeometry&>(geometry);
+				const float r = capsule.radius, hh = capsule.halfHeight;
+				circle(pose, PxVec3(hh, 0, 0), r, 0, color);
+				circle(pose, PxVec3(-hh, 0, 0), r, 0, color);
+				const int sides = 12; // lines along the axis, enough to read the width from any direction
+				for (int k = 0; k < sides; ++k)
+				{
+					const float a = k * PxTwoPi / sides;
+					const PxVec3 o(0, r * std::cos(a), r * std::sin(a));
+					line(pose.transform(PxVec3(hh, 0, 0) + o), pose.transform(PxVec3(-hh, 0, 0) + o), color);
+				}
+				// end caps: half circles in the xy and xz planes
+				circle(pose, PxVec3(hh, 0, 0), r, 2, color, -PxHalfPi, PxHalfPi);
+				circle(pose, PxVec3(-hh, 0, 0), r, 2, color, PxHalfPi, PxHalfPi * 3);
+				circle(pose, PxVec3(hh, 0, 0), r, 1, color, 0, PxPi);
+				circle(pose, PxVec3(-hh, 0, 0), r, 1, color, PxPi, PxTwoPi);
+			}
+			break;
+			case PxGeometryType::eCONVEXMESH:
+			{
+				const PxConvexMeshGeometry& convex = static_cast<const PxConvexMeshGeometry&>(geometry);
+				const PxConvexMesh* mesh = convex.convexMesh;
+				if (mesh == nullptr)
+					break;
+				const PxMat33 scale = convex.scale.toMat33();
+				const PxVec3* vertices = mesh->getVertices();
+				const PxU8* indices = mesh->getIndexBuffer();
+				for (PxU32 i = 0; i < mesh->getNbPolygons(); ++i)
+				{
+					PxHullPolygon polygon;
+					if (!mesh->getPolygonData(i, polygon))
+						continue;
+					for (PxU32 k = 0; k < polygon.mNbVerts; ++k)
+					{
+						const PxVec3 a = vertices[indices[polygon.mIndexBase + k]];
+						const PxVec3 b = vertices[indices[polygon.mIndexBase + (k + 1) % polygon.mNbVerts]];
+						line(pose.transform(scale * a), pose.transform(scale * b), color);
+					}
+				}
+			}
+			break;
+			case PxGeometryType::eTRIANGLEMESH:
+			{
+				const PxTriangleMeshGeometry& tm = static_cast<const PxTriangleMeshGeometry&>(geometry);
+				const PxTriangleMesh* mesh = tm.triangleMesh;
+				if (mesh == nullptr || mesh->getNbTriangles() > kDebugMaxTriangles)
+					break;
+				const PxMat33 scale = tm.scale.toMat33();
+				const PxVec3* vertices = mesh->getVertices();
+				const bool wide = !(mesh->getTriangleMeshFlags() & PxTriangleMeshFlag::e16_BIT_INDICES);
+				const void* indices = mesh->getTriangles();
+				for (PxU32 t = 0; t < mesh->getNbTriangles(); ++t)
+				{
+					PxU32 v[3];
+					for (int k = 0; k < 3; ++k)
+						v[k] = wide ? static_cast<const PxU32*>(indices)[3 * t + k] : static_cast<const PxU16*>(indices)[3 * t + k];
+					for (int k = 0; k < 3; ++k)
+						line(pose.transform(scale * vertices[v[k]]), pose.transform(scale * vertices[v[(k + 1) % 3]]), color);
+				}
+			}
+			break;
+			case PxGeometryType::eHEIGHTFIELD:
+			{
+				const PxHeightFieldGeometry& hf = static_cast<const PxHeightFieldGeometry&>(geometry);
+				const PxHeightField* field = hf.heightField;
+				if (field == nullptr)
+					break;
+				const PxU32 rows = field->getNbRows(), columns = field->getNbColumns();
+				if (rows < 2 || columns < 2 || (uint64_t)(rows - 1) * (columns - 1) * 2 > kDebugMaxTriangles)
+					break;
+				// sample (row, column) is at local (row * rowScale, height * heightScale, column * columnScale)
+				auto vertex = [&](PxU32 r, PxU32 c) {
+					return pose.transform(PxVec3(r * hf.rowScale, field->getHeight((PxReal)r, (PxReal)c) * hf.heightScale, c * hf.columnScale));
+				};
+				for (PxU32 r = 0; r < rows; ++r)
+				{
+					for (PxU32 c = 0; c < columns; ++c)
+					{
+						if (r + 1 < rows) line(vertex(r, c), vertex(r + 1, c), color);
+						if (c + 1 < columns) line(vertex(r, c), vertex(r, c + 1), color);
+					}
+				}
+			}
+			break;
+			default:
+				break;
+			}
+		};
+
+		auto draw_actor = [&](const PxRigidActor& actor, const XMFLOAT4& color) {
+			const PxU32 count = actor.getNbShapes();
+			wi::vector<PxShape*> shapes(count);
+			actor.getShapes(shapes.data(), count);
+			for (const PxShape* shape : shapes)
+				draw_shape(actor, *shape, color);
+		};
+
+		const XMFLOAT4 color_static = XMFLOAT4(0.3f, 1.0f, 0.3f, 1);
+		const XMFLOAT4 color_dynamic = XMFLOAT4(1.0f, 0.6f, 0.1f, 1);
+		const XMFLOAT4 color_link = XMFLOAT4(0.2f, 0.8f, 1.0f, 1);
+		const PxActorTypeFlags types = PxActorTypeFlag::eRIGID_STATIC | PxActorTypeFlag::eRIGID_DYNAMIC;
+		const PxU32 actor_count = physics_scene.scene->getNbActors(types);
+		wi::vector<PxActor*> actors(actor_count);
+		physics_scene.scene->getActors(types, actors.data(), actor_count);
+		for (PxActor* actor : actors)
+		{
+			if (const PxRigidActor* rigid = actor->is<PxRigidActor>())
+				draw_actor(*rigid, actor->getType() == PxActorType::eRIGID_STATIC ? color_static : color_dynamic);
+		}
+		const PxU32 articulation_count = physics_scene.scene->getNbArticulations();
+		wi::vector<PxArticulationReducedCoordinate*> articulations(articulation_count);
+		physics_scene.scene->getArticulations(articulations.data(), articulation_count);
+		for (PxArticulationReducedCoordinate* articulation : articulations)
+		{
+			const PxU32 link_count = articulation->getNbLinks();
+			wi::vector<PxArticulationLink*> links(link_count);
+			articulation->getLinks(links.data(), link_count);
+			for (const PxArticulationLink* link : links)
+				draw_actor(*link, color_link);
+		}
+	}
+
 	void RunPhysicsUpdateSystem(wi::jobsystem::context& ctx, Scene& scene, float dt)
 	{
 		if (!IsEnabled() || dt <= 0)
@@ -1833,6 +2025,11 @@ namespace wi::physics
 			physicscomponent.root_linear_velocity = cast(articulation.root_linear_velocity);
 			physicscomponent.root_angular_velocity = cast(articulation.root_angular_velocity);
 			physicscomponent.root_linear_acceleration = cast(articulation.root_linear_acceleration);
+		}
+
+		if (DEBUGDRAW_ENABLED)
+		{
+			DebugDrawShapes(scene, physics_scene);
 		}
 
 		wi::profiler::EndRange(range);
