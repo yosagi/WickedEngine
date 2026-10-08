@@ -244,6 +244,9 @@ namespace wi::physics
 			//	than by the render frame - a frame's worth of steps taken back to back is a different experiment
 			//	(measured 2026-09-12: LowState came out at 4064 Hz in bursts instead of 500 Hz).
 			mutable std::recursive_mutex step_mutex;
+			// PxScene is not safe for concurrent writes. The rigid body creation runs as parallel jobs inside the update, where
+			//	StepLock is skipped (the update already holds step_mutex), so actor insertion / removal is serialized here instead
+			std::mutex scene_write_mutex;
 			std::atomic<bool> update_in_progress = false;
 			std::atomic<bool> step_thread_running = false;
 			std::atomic<bool> step_thread_quit = false;
@@ -403,6 +406,7 @@ namespace wi::physics
 				{
 					PhysicsScene* px_physics_scene = (PhysicsScene*)physics_scene.get();
 					StepLock step_lock(*px_physics_scene);
+					std::scoped_lock write_lock(px_physics_scene->scene_write_mutex);
 					if (px_physics_scene->scene != nullptr)
 					{
 						px_physics_scene->scene->removeActor(*actor);
@@ -1408,6 +1412,7 @@ namespace wi::physics
 			physicsobject.actor->userData = &physicsobject.user_data;
 			{
 				StepLock step_lock(physics_scene);
+				std::scoped_lock write_lock(physics_scene.scene_write_mutex);
 				physics_scene.scene->addActor(*physicsobject.actor);
 				if (dynamic && !kinematic && physicsobject.start_deactivated)
 				{
